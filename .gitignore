@@ -1,0 +1,12 @@
+# Pastas de build/firmware QMK e ambientes virtuais
+firmware/
+.venv/
+__pycache__/
+*.py[cod]
+
+# Estado local e preferências pessoais
+automation_config.json
+battery_history.json
+keyboard_state.json
+mouse_state.json
+profiles.json
