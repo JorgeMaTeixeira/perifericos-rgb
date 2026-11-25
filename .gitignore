@@ -7,6 +7,7 @@ __pycache__/
 # Estado local e preferências pessoais
 automation_config.json
 battery_history.json
+headphones_state.json
 keyboard_state.json
 mouse_state.json
 profiles.json

@@ -44,6 +44,7 @@ from automation import (
 )
 from battery_dialog import BatteryHistoryDialog
 from battery_log import format_battery_summary, record_battery
+from headphones_tab import HeadphonesTab
 from mouse_tab import MouseTab
 from via_hid import EFFECTS, KeychronRGBDevice
 
@@ -294,8 +295,8 @@ class KeychronRGBWindow(QMainWindow):
         self._profiles: dict[str, dict] = self._load_profiles()
 
         self.setWindowTitle("Periféricos RGB")
-        self.setMinimumWidth(510)
-        self.setMaximumWidth(600)
+        self.setMinimumWidth(680)
+        self.setMaximumWidth(820)
 
         # Timers para evitar envio excessivo ao arrastar sliders
         self._brightness_timer = QTimer(self)
@@ -691,8 +692,11 @@ class KeychronRGBWindow(QMainWindow):
         self.mouse_tab = MouseTab()
         self.mouse_tab.syncColorRequested.connect(self._apply_rgb_from_mouse)
         self.mouse_tab.batteryUpdated.connect(self._update_tray_tooltip)
+        self.headphones_tab = HeadphonesTab()
+        self.headphones_tab.batteryUpdated.connect(self._update_tray_tooltip)
         self.tabs.addTab(kb_tab, "Teclado · Keychron V6 Max")
         self.tabs.addTab(self.mouse_tab, "Rato · Glorious Model I 2")
+        self.tabs.addTab(self.headphones_tab, "Auscultadores · REDMI Neo")
         outer_layout.addWidget(self.tabs)
         outer_layout.addWidget(self.auto_card)
         self._load_auto_ui()
@@ -1323,6 +1327,12 @@ class KeychronRGBWindow(QMainWindow):
         self._tray_profiles_menu = menu.addMenu("Perfis (Teclado + Rato)")
         self._rebuild_tray_profiles()
 
+        self._tray_hp_anc_menu = menu.addMenu("Auscultadores (ANC)")
+        for mode_id, mode_label in ((0, "Desligado"), (1, "Cancelamento de Ruído"), (2, "Transparência")):
+            act = QAction(mode_label, self._tray_hp_anc_menu)
+            act.triggered.connect(lambda _, m=mode_id: self.headphones_tab.set_anc_mode(m))
+            self._tray_hp_anc_menu.addAction(act)
+
         menu.addSeparator()
         quit_act = menu.addAction("Sair")
         quit_act.triggered.connect(self._quit_app)
@@ -1417,8 +1427,16 @@ class KeychronRGBWindow(QMainWindow):
         kb_str = f"{kb_pct}%" if kb_pct is not None else "--%"
         if kb_charging:
             kb_str += " (USB-C)"
-        self._tray_bat_action.setText(f"Teclado: {kb_str}  |  Rato: {bat_str}")
-        self._tray.setToolTip(f"Periféricos RGB — Teclado: {kb_str} | Rato: {bat_str}")
+        hp_pct = self.headphones_tab.state.battery_pct
+        hp_str = f"{hp_pct}%" if hp_pct is not None else "--%"
+        if self.headphones_tab.device.connected and hp_pct is not None:
+            self._tray_bat_action.setText(f"Teclado: {kb_str}  |  Rato: {bat_str}  |  Neo: {hp_str}")
+            self._tray.setToolTip(
+                f"Periféricos RGB — Teclado: {kb_str} | Rato: {bat_str} | Neo: {hp_str}"
+            )
+        else:
+            self._tray_bat_action.setText(f"Teclado: {kb_str}  |  Rato: {bat_str}")
+            self._tray.setToolTip(f"Periféricos RGB — Teclado: {kb_str} | Rato: {bat_str}")
 
         icon_key = (kb_pct, pct, kb_charging or mouse_charging)
         if icon_key != self._last_tray_icon_key:
@@ -1496,6 +1514,7 @@ class KeychronRGBWindow(QMainWindow):
             self._tray.hide()
         self.device.close()
         self.mouse_tab.close_device()
+        self.headphones_tab.close_device()
         super().closeEvent(event)
 
 

@@ -4,13 +4,15 @@ Aplicação desktop nativa em tema escuro (**PySide6**) para controlar a ilumina
 
 - **Keychron V6 Max (VIA v12):** controlo de efeitos, brilho, velocidade, cor, perfis rápidos, gravação na EEPROM e ligação automática via **2.4G (`Keychron Link`)** ou **USB-C**.
 - **Glorious Model I 2 Wireless:** leitura passiva da percentagem de bateria, estado de carregamento e controlo de efeitos RGB, brilho, velocidade e cor via **2.4G** ou **USB-C**.
+- **REDMI Headphones Neo (Bluetooth RFCOMM + PipeWire):** controlo de **ANC** (Desligado / Cancelamento de Ruído / Transparência), **Equalizador (EQ)**, **Perfis Rápidos**, **Ligação Dupla (Dual-Device)**, leitura/histórico de bateria, atalho na bandeja (*system tray*) e troca de codec/perfil **PipeWire** (`A2DP SBC / SBC-XQ` ↔ `HFP mSBC`).
 - **Automação Silenciosa (`systemd --user`):** cálculo solar offline (nascer/pôr do sol) e deteção de bloqueio de ecrã GNOME via D-Bus para ligar/desligar as luzes automaticamente.
 
 ---
 
 ## Requisitos
 
-- Linux com **Python 3.10+** e **PySide6**
+- Linux com **Python 3.10+** (compilado com suporte `AF_BLUETOOTH` / `BTPROTO_RFCOMM`) e **PySide6**
+- **BlueZ** (`bluetoothctl`) e **PipeWire / PulseAudio** (`pactl`) para os **REDMI Headphones Neo**
 - Regras `udev` com permissão de leitura/escrita em `/dev/hidraw*` para:
   - **Keychron** (`idVendor == "3434"`)
   - **Glorious Model I 2** (`idVendor == "093a"`)
@@ -72,6 +74,32 @@ Ao corrigir para:
 ```
 
 e com o dongle **Keychron Link (`3434:d030`)** na versão **`d.3.0`** + módulo wireless **`0.2.4`**, o protocolo VIA passa a responder diretamente em modo 2.4 GHz.
+
+---
+
+## Estrutura do Projeto
+
+- `app.py` — Janela principal (`PySide6`), separador do teclado, bandeja do sistema (*system tray*) e automação.
+- `via_hid.py` — Protocolo VIA/QMK por HID para o **Keychron V6 Max**.
+- `glorious_hid.py` & `mouse_tab.py` — Protocolo HID e separador do **Glorious Model I 2 Wireless**.
+- `redmi_bt.py` & `headphones_tab.py` — Cliente RFCOMM, integração `pactl` e separador dos **REDMI Headphones Neo**.
+- `battery_log.py` & `battery_dialog.py` — Histórico de bateria persistente e gráfico de autonomia.
+- `automation.py` — Cálculo solar, monitorização GNOME D-Bus e notificações de bateria.
+
+---
+
+## Protocolo Bluetooth dos REDMI Headphones Neo
+
+Os **REDMI Headphones Neo** utilizam **Bluetooth Classic RFCOMM** no **Canal 6** (UUID `0000fd2d-0000-1000-8000-00805f9b34fb`) com enquadramento binário `FE DC BA <flag> <opcode> <len:2B> <payload> EF` (protocolo Xiaomi/JieLi RCSP):
+
+- **`0x02`** — Informação do dispositivo e percentagem de bateria (com fallback passivo para `bluetoothctl info`).
+- **`0x08`** — Modo de controlo de ruído (`0x00` Desligado, `0x01` Cancelamento de Ruído, `0x02` Transparência).
+- **`0xF2` / `0xF3`** — Leitura e escrita de atributos:
+  - `0x0007`: Equalizador (`0x15` Som Balanceado, `0x05` Melhorar Graves, `0x06` Melhorar Agudos, `0x01` Melhorar Voz, `0x0A` Personalizado).
+  - `0x000B`: Estado atual de ANC.
+  - `0x0004`: Ligação dupla (*Dual-Device*).
+
+> **Nota (*Dual-Device*):** o canal RFCOMM 6 aceita apenas uma ligação de controlo de cada vez. Se a app *Xiaomi Earbuds* no telemóvel estiver ativa a segurar o canal, a app no Linux mostra o estado e continua a ler a bateria via BlueZ.
 
 ---
 
