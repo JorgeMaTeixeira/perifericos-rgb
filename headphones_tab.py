@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import threading
+
 from PySide6.QtCore import Qt, QTimer, Signal
 from PySide6.QtWidgets import (
     QCheckBox,
@@ -38,14 +40,21 @@ class HeadphonesTab(QWidget):
     """Painel de bateria, perfis rápidos, ANC, EQ e áudio PipeWire dos REDMI Headphones Neo."""
 
     batteryUpdated = Signal()
+    _syncCompleted = Signal(object)
+    _passivePollCompleted = Signal(object, object)
 
     def __init__(self, parent: QWidget | None = None) -> None:
         super().__init__(parent)
         self.device = RedmiHeadphonesDevice()
         self.state: HeadphonesState = load_headphones_state()
         self._syncing = False
+        self._sync_busy = False
+        self._poll_busy = False
         self._low_bat_alerted = False
         self._anc_buttons: dict[int, QPushButton] = {}
+
+        self._syncCompleted.connect(self._on_sync_completed)
+        self._passivePollCompleted.connect(self._on_passive_poll_completed)
 
         self._battery_timer = QTimer(self)
         self._battery_timer.setInterval(15000)
@@ -291,7 +300,19 @@ class HeadphonesTab(QWidget):
         self._syncing = False
 
     def _poll_battery_passive(self) -> None:
-        mac = find_connected_redmi_mac()
+        if self._poll_busy or self._sync_busy:
+            return
+        self._poll_busy = True
+
+        def _worker() -> None:
+            mac = find_connected_redmi_mac()
+            pct = read_bluez_battery(mac) if mac else None
+            self._passivePollCompleted.emit(mac, pct)
+
+        threading.Thread(target=_worker, daemon=True).start()
+
+    def _on_passive_poll_completed(self, mac: str | None, pct: int | None) -> None:
+        self._poll_busy = False
         if not mac:
             if self.device.connected:
                 self.device.connected = False
@@ -302,7 +323,6 @@ class HeadphonesTab(QWidget):
 
         self.device.mac = mac
         self.device.connected = True
-        pct = read_bluez_battery(mac)
         if pct is not None and pct != self.state.battery_pct:
             self.state.battery_pct = pct
             save_headphones_state(self.state)
@@ -311,7 +331,35 @@ class HeadphonesTab(QWidget):
             self.batteryUpdated.emit()
 
     def connect_and_sync(self) -> None:
-        mac = find_connected_redmi_mac()
+        if self._sync_busy:
+            return
+        self._sync_busy = True
+        self.refresh_btn.setEnabled(False)
+        self.status_lbl.setText("A sincronizar auscultadores...")
+
+        def _worker() -> None:
+            mac = find_connected_redmi_mac()
+            if not mac:
+                self._syncCompleted.emit({"mac": None})
+                return
+            active_audio, audio_profiles = get_audio_profiles(mac)
+            info = self.device.sync_all()
+            self._syncCompleted.emit(
+                {
+                    "mac": mac,
+                    "active_audio": active_audio,
+                    "audio_profiles": audio_profiles,
+                    "rfcomm_busy": self.device.rfcomm_busy,
+                    **info,
+                }
+            )
+
+        threading.Thread(target=_worker, daemon=True).start()
+
+    def _on_sync_completed(self, data: dict) -> None:
+        self._sync_busy = False
+        self.refresh_btn.setEnabled(True)
+        mac = data.get("mac")
         if not mac:
             self.device.connected = False
             self.status_lbl.setText("Auscultadores desligados")
@@ -321,27 +369,43 @@ class HeadphonesTab(QWidget):
             return
 
         self.state.mac = mac
-        self._refresh_audio_profiles(mac)
-        name, bat = self.device.get_device_info()
+        self._syncing = True
+        self.audio_combo.clear()
+        audio_profiles = data.get("audio_profiles") or []
+        active_audio = data.get("active_audio")
+        if audio_profiles:
+            self.audio_combo.setEnabled(True)
+            for pid, label in audio_profiles:
+                self.audio_combo.addItem(label, pid)
+            if active_audio:
+                idx = self.audio_combo.findData(active_audio)
+                if idx >= 0:
+                    self.audio_combo.setCurrentIndex(idx)
+        else:
+            self.audio_combo.setEnabled(False)
+        self._syncing = False
+
+        name = data.get("name")
+        bat = data.get("battery")
         if name:
             self.state.name = name
 
-        if self.device.rfcomm_busy:
+        if data.get("rfcomm_busy"):
             self.status_lbl.setText(f"Ligado ({mac}) · Canal ocupado pelo telemóvel")
             self._set_rfcomm_controls_enabled(False)
             self.feedback_lbl.setText("Fecha a app Xiaomi Earbuds no telemóvel para controlar aqui")
         else:
             self.status_lbl.setText(f"Ligado · Bluetooth ({mac})")
             self._set_rfcomm_controls_enabled(True)
-            anc = self.device.get_anc_mode()
+            anc = data.get("anc_mode")
             if anc is not None:
                 self.state.anc_mode = anc
-            eq = self.device.get_eq_preset()
+            eq = data.get("eq_preset")
             if eq is not None:
                 self.state.eq_preset = eq
                 if self.eq_combo.findData(eq) < 0:
                     self.eq_combo.addItem(f"Perfil (0x{eq:02x})", eq)
-            dual = self.device.get_dual_connection()
+            dual = data.get("dual_connection")
             if dual is not None:
                 self.state.dual_connection = dual
             self.feedback_lbl.setText("Estado sincronizado ✓")

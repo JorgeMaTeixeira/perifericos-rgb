@@ -16,6 +16,8 @@ echo "==> A instalar regras udev para Keychron (3434) e Glorious (093a)..."
 sudo tee /etc/udev/rules.d/99-perifericos-rgb.rules >/dev/null <<'EOF'
 KERNEL=="hidraw*", SUBSYSTEM=="hidraw", ATTRS{idVendor}=="3434", MODE="0660", TAG+="uaccess"
 KERNEL=="hidraw*", SUBSYSTEM=="hidraw", ATTRS{idVendor}=="093a", MODE="0660", TAG+="uaccess"
+KERNEL=="event*", SUBSYSTEM=="input", ATTRS{idVendor}=="3434", TAG+="uaccess"
+KERNEL=="event*", SUBSYSTEM=="input", ATTRS{idVendor}=="093a", TAG+="uaccess"
 EOF
 sudo udevadm control --reload-rules
 sudo udevadm trigger
@@ -25,13 +27,13 @@ mkdir -p "$HOME/.local/share/applications"
 cat > "$HOME/.local/share/applications/keychron-rgb.desktop" <<EOF
 [Desktop Entry]
 Name=Periféricos RGB
-Comment=Controlo RGB e bateria para Keychron V6 Max e Glorious Model I 2
-Exec=python3 $APP_DIR/app.py
+Comment=Controlo RGB, bateria e áudio para Keychron V6 Max, Glorious Model I 2 e REDMI Neo
+Exec=python3 "$APP_DIR/app.py"
 Icon=$APP_DIR/icon.svg
 Terminal=false
 Type=Application
 Categories=Utility;Settings;HardwareSettings;
-Keywords=keychron;glorious;rgb;keyboard;mouse;
+Keywords=keychron;glorious;redmi;rgb;keyboard;mouse;headphones;
 EOF
 update-desktop-database "$HOME/.local/share/applications" >/dev/null 2>&1 || true
 
@@ -44,7 +46,7 @@ After=graphical-session.target
 
 [Service]
 Type=simple
-ExecStart=/usr/bin/python3 $APP_DIR/automation.py --daemon
+ExecStart=/usr/bin/python3 "$APP_DIR/automation.py" --daemon
 Restart=on-failure
 RestartSec=5
 

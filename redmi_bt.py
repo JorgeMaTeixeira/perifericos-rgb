@@ -10,6 +10,8 @@ import socket
 import subprocess
 import time
 
+from shared_utils import atomic_write_json
+
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 HEADPHONES_STATE_PATH = os.path.join(BASE_DIR, "headphones_state.json")
 
@@ -80,8 +82,7 @@ def load_headphones_state() -> HeadphonesState:
 
 def save_headphones_state(state: HeadphonesState) -> None:
     try:
-        with open(HEADPHONES_STATE_PATH, "w", encoding="utf-8") as f:
-            json.dump(asdict(state), f, indent=2)
+        atomic_write_json(HEADPHONES_STATE_PATH, asdict(state))
     except OSError:
         pass
 
@@ -228,9 +229,8 @@ class RedmiHeadphonesDevice:
         """Abre uma ligação RFCOMM curta ao canal 6, envia o comando e devolve a resposta."""
         return self._rfcomm_exchange_batch([(opcode, body)], timeout=timeout)[0]
 
-    def get_device_info(self) -> tuple[str | None, int | None]:
-        """Lê o nome e a percentagem de bateria via opcode 0x02 (com fallback BlueZ)."""
-        payload = self._rfcomm_exchange(0x02, b"\xff\xff\xff\xff")
+    @staticmethod
+    def _parse_device_info_payload(payload: bytes | None) -> tuple[str | None, int | None]:
         name: str | None = None
         bat: int | None = None
         if payload and len(payload) >= 3 and payload[0] == 0x00:
@@ -249,19 +249,52 @@ class RedmiHeadphonesDevice:
                 elif ttype == 0x07 and len(tdata) >= 2 and bat is None:
                     bat = int(tdata[1])
                 pos += 1 + tlen
-        if bat is None and self.mac:
-            bat = read_bluez_battery(self.mac)
         return name, bat
 
-    def _get_attr(self, attr_id: int) -> bytes | None:
-        payload = self._rfcomm_exchange(0xF3, bytes([(attr_id >> 8) & 0xFF, attr_id & 0xFF]))
+    @staticmethod
+    def _parse_attr_payload(payload: bytes | None) -> bytes | None:
         if not payload or len(payload) < 5 or payload[0] != 0x00:
             return None
-        # Formato: [status, seq, len, attr_hi, attr_lo, val...]
         tlen = payload[2]
         if tlen < 2 or 3 + tlen > len(payload):
             return None
         return payload[5 : 3 + tlen]
+
+    def get_device_info(self) -> tuple[str | None, int | None]:
+        """Lê o nome e a percentagem de bateria via opcode 0x02 (com fallback BlueZ)."""
+        payload = self._rfcomm_exchange(0x02, b"\xff\xff\xff\xff")
+        name, bat = self._parse_device_info_payload(payload)
+        if bat is None and self.mac:
+            bat = read_bluez_battery(self.mac)
+        return name, bat
+
+    def sync_all(self) -> dict[str, object]:
+        """Lê info/bateria, ANC, EQ e ligação dupla numa única ligação RFCOMM."""
+        res = self._rfcomm_exchange_batch(
+            [
+                (0x02, b"\xff\xff\xff\xff"),
+                (0xF3, b"\x00\x0b"),
+                (0xF3, b"\x00\x07"),
+                (0xF3, b"\x00\x04"),
+            ]
+        )
+        name, bat = self._parse_device_info_payload(res[0])
+        if bat is None and self.mac:
+            bat = read_bluez_battery(self.mac)
+        anc_val = self._parse_attr_payload(res[1])
+        eq_val = self._parse_attr_payload(res[2])
+        dual_val = self._parse_attr_payload(res[3])
+        return {
+            "name": name,
+            "battery": bat,
+            "anc_mode": int(anc_val[0]) if anc_val else None,
+            "eq_preset": int(eq_val[0]) if eq_val else None,
+            "dual_connection": bool(dual_val[0]) if dual_val else None,
+        }
+
+    def _get_attr(self, attr_id: int) -> bytes | None:
+        payload = self._rfcomm_exchange(0xF3, bytes([(attr_id >> 8) & 0xFF, attr_id & 0xFF]))
+        return self._parse_attr_payload(payload)
 
     def get_anc_mode(self) -> int | None:
         val = self._get_attr(0x000B)

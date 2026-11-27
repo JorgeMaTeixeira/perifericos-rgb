@@ -6,6 +6,8 @@ import json
 import os
 import time
 
+from shared_utils import atomic_write_json
+
 BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 HISTORY_PATH = os.path.join(BASE_DIR, "battery_history.json")
 
@@ -28,8 +30,7 @@ def _load_history() -> dict:
 
 def _save_history(data: dict) -> None:
     try:
-        with open(HISTORY_PATH, "w", encoding="utf-8") as f:
-            json.dump(data, f, indent=2)
+        atomic_write_json(HISTORY_PATH, data)
     except OSError:
         pass
 

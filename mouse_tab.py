@@ -21,7 +21,7 @@ from PySide6.QtWidgets import (
 )
 
 from automation import load_config as load_auto_config
-from automation import notify_full_battery, notify_low_battery
+from automation import notify_full_battery, notify_low_battery, set_manual_override
 from battery_dialog import BatteryHistoryDialog
 from battery_log import format_battery_summary, record_battery
 from glorious_hid import (
@@ -67,6 +67,7 @@ class MouseTab(QWidget):
         self._full_bat_alerted = False
         self._saver_active = False
         self._pre_saver_brightness: int | None = None
+        self._reconnect_ticks = 0
         self._last_active_effect = (
             self.state.effect if self.state.effect > 0 else self.state.last_active_effect
         )
@@ -415,6 +416,8 @@ class MouseTab(QWidget):
             else:
                 btn.setStyleSheet("padding: 4px 6px; font-size: 11px;")
             btn.blockSignals(False)
+        if not self._syncing:
+            self._persist_state()
 
     def _apply_performance(self) -> None:
         stages: list[tuple[int, tuple[int, int, int]]] = []
@@ -612,8 +615,12 @@ class MouseTab(QWidget):
     def _poll_battery(self) -> None:
         self._sync_external_state()
         if not self.device.is_connected:
-            self.connect_mouse()
+            self._reconnect_ticks += 1
+            if self._reconnect_ticks >= 10:
+                self._reconnect_ticks = 0
+                self.connect_mouse()
             return
+        self._reconnect_ticks = 0
         pct = self.device.poll_battery_frame()
         if pct is not None:
             self.state.battery_pct = pct
@@ -684,6 +691,7 @@ class MouseTab(QWidget):
         self._update_dependent_controls(target_eff)
         self._syncing = False
         self._send_lighting()
+        set_manual_override("on" if checked else "off")
 
     def _on_effect_changed(self) -> None:
         if self._syncing:

@@ -10,6 +10,8 @@ import select
 import time
 from dataclasses import dataclass, field
 
+from shared_utils import atomic_write_json, find_input_events, hid_lock
+
 VENDOR_ID = 0x093A
 PID_USB = 0x821A
 PID_RECEIVER = 0x821D
@@ -56,7 +58,7 @@ def _hidiocsfeature(length: int) -> int:
 
 def _scale_0_100(v: float, zero_is_off: bool) -> int:
     if v > 4:
-        return int(v * 20 / 100)
+        return min(20, max(1, round(v * 20 / 100)))
     if zero_is_off and v == 0:
         return 0
     return 1
@@ -86,27 +88,8 @@ def find_glorious_hidraw() -> tuple[str, str] | None:
 
 def find_glorious_mouse_event() -> str | None:
     """Procura o /dev/input/event* do rato Glorious (eixos X/Y) via receiver 2.4G."""
-    target_vid = f"{VENDOR_ID:04x}"
-    target_pid = f"{PID_RECEIVER:04x}"
-    for sys_path in sorted(glob.glob("/sys/class/input/event*")):
-        try:
-            with open(os.path.join(sys_path, "device", "id", "vendor"), "r", encoding="utf-8") as f:
-                vid = f.read().strip().lower()
-            with open(os.path.join(sys_path, "device", "id", "product"), "r", encoding="utf-8") as f:
-                pid = f.read().strip().lower()
-            if vid != target_vid or pid != target_pid:
-                continue
-            rel_path = os.path.join(sys_path, "device", "capabilities", "rel")
-            with open(rel_path, "r", encoding="utf-8") as f:
-                rel_caps = int(f.read().strip().split()[-1], 16)
-            if (rel_caps & 0x3) != 0x3:
-                continue
-            ev_path = f"/dev/input/{os.path.basename(sys_path)}"
-            if os.access(ev_path, os.R_OK):
-                return ev_path
-        except (OSError, ValueError, IndexError):
-            continue
-    return None
+    paths = find_input_events(VENDOR_ID, (PID_RECEIVER,), require_rel_xy=True)
+    return paths[0] if paths else None
 
 
 @dataclass
@@ -194,8 +177,7 @@ def load_mouse_state() -> MouseState:
 
 def save_mouse_state(state: MouseState) -> None:
     try:
-        with open(MOUSE_STATE_PATH, "w", encoding="utf-8") as f:
-            json.dump(state.to_dict(), f, indent=2)
+        atomic_write_json(MOUSE_STATE_PATH, state.to_dict())
     except OSError:
         pass
 
@@ -346,25 +328,26 @@ class GloriousMouseDevice:
         speed_pct: int,
         rgb: tuple[int, int, int],
     ) -> None:
-        if self.fd is None:
-            raise ConnectionError("Rato não ligado.")
-        reports = build_lighting_reports(
-            effect_id=effect_id,
-            brightness_pct=brightness_pct,
-            speed_pct=speed_pct,
-            rgb=rgb,
-            conn=self.conn_type,
-        )
-        pacing = 0.10 if self.conn_type == "usb" else 0.05
-        req = _hidiocsfeature(64)
-        try:
-            for idx, rpt in enumerate(reports):
-                fcntl.ioctl(self.fd, req, bytearray(rpt))
-                if idx < len(reports) - 1:
-                    time.sleep(pacing)
-        except OSError as exc:
-            self.close()
-            raise ConnectionError(f"Erro HID ao configurar rato: {exc}") from exc
+        with hid_lock():
+            if self.fd is None:
+                raise ConnectionError("Rato não ligado.")
+            reports = build_lighting_reports(
+                effect_id=effect_id,
+                brightness_pct=brightness_pct,
+                speed_pct=speed_pct,
+                rgb=rgb,
+                conn=self.conn_type,
+            )
+            pacing = 0.10 if self.conn_type == "usb" else 0.05
+            req = _hidiocsfeature(64)
+            try:
+                for idx, rpt in enumerate(reports):
+                    fcntl.ioctl(self.fd, req, bytearray(rpt))
+                    if idx < len(reports) - 1:
+                        time.sleep(pacing)
+            except OSError as exc:
+                self.close()
+                raise ConnectionError(f"Erro HID ao configurar rato: {exc}") from exc
 
     def set_performance(
         self,
@@ -374,43 +357,45 @@ class GloriousMouseDevice:
         lift_off: int = 1,
         debounce: int = 2,
     ) -> None:
-        if self.fd is None:
-            raise ConnectionError("Rato não ligado.")
-        reports = build_performance_reports(
-            dpi_stages=dpi_stages,
-            active_stage=active_stage,
-            polling_rate=polling_rate,
-            conn=self.conn_type,
-            lift_off=lift_off,
-            debounce=debounce,
-        )
-        req = _hidiocsfeature(64)
-        try:
-            for idx, rpt in enumerate(reports):
-                fcntl.ioctl(self.fd, req, bytearray(rpt))
-                if idx < len(reports) - 1:
-                    time.sleep(0.15)
-        except OSError as exc:
-            self.close()
-            raise ConnectionError(f"Erro HID ao configurar desempenho do rato: {exc}") from exc
+        with hid_lock():
+            if self.fd is None:
+                raise ConnectionError("Rato não ligado.")
+            reports = build_performance_reports(
+                dpi_stages=dpi_stages,
+                active_stage=active_stage,
+                polling_rate=polling_rate,
+                conn=self.conn_type,
+                lift_off=lift_off,
+                debounce=debounce,
+            )
+            req = _hidiocsfeature(64)
+            try:
+                for idx, rpt in enumerate(reports):
+                    fcntl.ioctl(self.fd, req, bytearray(rpt))
+                    if idx < len(reports) - 1:
+                        time.sleep(0.15)
+            except OSError as exc:
+                self.close()
+                raise ConnectionError(f"Erro HID ao configurar desempenho do rato: {exc}") from exc
 
     def poll_battery_frame(self) -> int | None:
         """Lê frames pendentes sem bloquear e devolve a % de bateria se recebida."""
-        if self.fd is None:
-            return None
-        latest_pct: int | None = None
-        try:
-            while True:
-                ready, _, _ = select.select([self.fd], [], [], 0.0)
-                if not ready:
-                    break
-                data = os.read(self.fd, 64)
-                if len(data) >= 3 and data[0] == 0x06 and data[1] == 0xFB:
-                    pct = data[2]
-                    if 0 <= pct <= 100:
-                        latest_pct = pct
-        except BlockingIOError:
-            pass
-        except OSError:
-            self.close()
-        return latest_pct
+        with hid_lock():
+            if self.fd is None:
+                return None
+            latest_pct: int | None = None
+            try:
+                while True:
+                    ready, _, _ = select.select([self.fd], [], [], 0.0)
+                    if not ready:
+                        break
+                    data = os.read(self.fd, 64)
+                    if len(data) >= 3 and data[0] == 0x06 and data[1] == 0xFB:
+                        pct = data[2]
+                        if 0 <= pct <= 100:
+                            latest_pct = pct
+            except BlockingIOError:
+                pass
+            except OSError:
+                self.close()
+            return latest_pct

@@ -8,6 +8,8 @@ import select
 import time
 from dataclasses import dataclass
 
+from shared_utils import hid_lock
+
 VENDOR_ID = 0x3434
 PRODUCT_ID = 0x0961
 DONGLE_PRODUCT_ID = 0xD030
@@ -95,33 +97,34 @@ class KeychronRGBDevice:
         return self.fd is not None
 
     def connect(self) -> str:
-        self.close()
-        candidates = [
-            (PRODUCT_ID, "USB-C"),
-            (DONGLE_PRODUCT_ID, "2.4G Keychron Link"),
-        ]
-        found_any = False
-        for pid, mode_label in candidates:
-            path = find_via_hidraw(VENDOR_ID, pid)
-            if not path:
-                continue
-            found_any = True
-            try:
-                self.fd = os.open(path, os.O_RDWR)
-                self.path = path
-                self._xfer([CMD_GET_PROTOCOL_VERSION], timeout=1.5)
-                self.connection_mode = mode_label
-                return path
-            except Exception:
-                self.close()
+        with hid_lock():
+            self.close()
+            candidates = [
+                (PRODUCT_ID, "USB-C"),
+                (DONGLE_PRODUCT_ID, "2.4G Keychron Link"),
+            ]
+            found_any = False
+            for pid, mode_label in candidates:
+                path = find_via_hidraw(VENDOR_ID, pid)
+                if not path:
+                    continue
+                found_any = True
+                try:
+                    self.fd = os.open(path, os.O_RDWR)
+                    self.path = path
+                    self._xfer([CMD_GET_PROTOCOL_VERSION], timeout=1.5)
+                    self.connection_mode = mode_label
+                    return path
+                except Exception:
+                    self.close()
 
-        if found_any:
-            raise TimeoutError(
-                "Teclado encontrado mas sem resposta (verifica se está acordado em 2.4G ou ligado em Cable)."
+            if found_any:
+                raise TimeoutError(
+                    "Teclado encontrado mas sem resposta (verifica se está acordado em 2.4G ou ligado em Cable)."
+                )
+            raise FileNotFoundError(
+                "Keychron V6 Max / Keychron Link não encontrado."
             )
-        raise FileNotFoundError(
-            "Keychron V6 Max / Keychron Link não encontrado."
-        )
 
     def close(self) -> None:
         if self.fd is not None:
@@ -147,45 +150,47 @@ class KeychronRGBDevice:
                 break
 
     def _xfer(self, payload: list[int], timeout: float = 1.5) -> list[int]:
-        if self.fd is None:
-            raise ConnectionError("Dispositivo não ligado.")
-        pkt = bytes([0x00] + payload + [0] * (32 - len(payload)))
-        expected_cmd = payload[0]
-        try:
-            self._drain_rx()
-            os.write(self.fd, pkt)
-            deadline = time.monotonic() + timeout
-            while True:
-                remaining = deadline - time.monotonic()
-                if remaining <= 0:
-                    raise TimeoutError("Tempo limite excedido ao comunicar com o teclado.")
-                ready, _, _ = select.select([self.fd], [], [], remaining)
-                if not ready:
-                    raise TimeoutError("Tempo limite excedido ao comunicar com o teclado.")
-                resp = os.read(self.fd, 32)
-                if resp and resp[0] == expected_cmd:
-                    return list(resp)
-        except OSError as exc:
-            self.close()
-            raise ConnectionError(f"Erro de comunicação HID: {exc}") from exc
+        with hid_lock():
+            if self.fd is None:
+                raise ConnectionError("Dispositivo não ligado.")
+            pkt = bytes([0x00] + payload + [0] * (32 - len(payload)))
+            expected_cmd = payload[0]
+            try:
+                self._drain_rx()
+                os.write(self.fd, pkt)
+                deadline = time.monotonic() + timeout
+                while True:
+                    remaining = deadline - time.monotonic()
+                    if remaining <= 0:
+                        raise TimeoutError("Tempo limite excedido ao comunicar com o teclado.")
+                    ready, _, _ = select.select([self.fd], [], [], remaining)
+                    if not ready:
+                        raise TimeoutError("Tempo limite excedido ao comunicar com o teclado.")
+                    resp = os.read(self.fd, 32)
+                    if resp and resp[0] == expected_cmd:
+                        return list(resp)
+            except OSError as exc:
+                self.close()
+                raise ConnectionError(f"Erro de comunicação HID: {exc}") from exc
 
     def get_state(self) -> RGBState:
-        proto = self._xfer([CMD_GET_PROTOCOL_VERSION])
-        protocol_version = (proto[1] << 8) | proto[2]
-        brightness = self._xfer([CMD_CUSTOM_GET_VALUE, RGB_CHANNEL_ID, VAL_BRIGHTNESS])[3]
-        effect = self._xfer([CMD_CUSTOM_GET_VALUE, RGB_CHANNEL_ID, VAL_EFFECT])[3]
-        speed = self._xfer([CMD_CUSTOM_GET_VALUE, RGB_CHANNEL_ID, VAL_EFFECT_SPEED])[3]
-        color_resp = self._xfer([CMD_CUSTOM_GET_VALUE, RGB_CHANNEL_ID, VAL_COLOR])
-        hue = color_resp[3]
-        saturation = color_resp[4]
-        return RGBState(
-            protocol_version=protocol_version,
-            brightness=brightness,
-            effect=effect,
-            speed=speed,
-            hue=hue,
-            saturation=saturation,
-        )
+        with hid_lock():
+            proto = self._xfer([CMD_GET_PROTOCOL_VERSION])
+            protocol_version = (proto[1] << 8) | proto[2]
+            brightness = self._xfer([CMD_CUSTOM_GET_VALUE, RGB_CHANNEL_ID, VAL_BRIGHTNESS])[3]
+            effect = self._xfer([CMD_CUSTOM_GET_VALUE, RGB_CHANNEL_ID, VAL_EFFECT])[3]
+            speed = self._xfer([CMD_CUSTOM_GET_VALUE, RGB_CHANNEL_ID, VAL_EFFECT_SPEED])[3]
+            color_resp = self._xfer([CMD_CUSTOM_GET_VALUE, RGB_CHANNEL_ID, VAL_COLOR])
+            hue = color_resp[3]
+            saturation = color_resp[4]
+            return RGBState(
+                protocol_version=protocol_version,
+                brightness=brightness,
+                effect=effect,
+                speed=speed,
+                hue=hue,
+                saturation=saturation,
+            )
 
     def set_brightness(self, value: int) -> None:
         val = max(0, min(255, int(value)))
@@ -206,6 +211,24 @@ class KeychronRGBDevice:
 
     def save_eeprom(self) -> None:
         self._xfer([CMD_CUSTOM_SAVE, RGB_CHANNEL_ID])
+
+    def apply_and_save_rgb(self, eff: int, bri: int, spd: int, hue: int, sat: int) -> None:
+        """Aplica todos os parâmetros RGB e grava cada campo na EEPROM (workaround da máscara VIA)."""
+        with hid_lock():
+            self.set_effect(eff)
+            self.save_eeprom()
+            self.set_brightness(bri)
+            self.save_eeprom()
+            self.set_speed(spd)
+            self.save_eeprom()
+            self.set_color(hue, sat)
+            self.save_eeprom()
+
+    def disable_and_save(self) -> None:
+        """Desliga o efeito RGB e grava na EEPROM para não reacender após sleep/indicadores."""
+        with hid_lock():
+            self.set_effect(0)
+            self.save_eeprom()
 
     def get_battery(self) -> int | None:
         """Lê a % de bateria do teclado (requer patch 0xAC no firmware)."""

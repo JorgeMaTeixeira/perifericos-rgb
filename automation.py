@@ -20,6 +20,10 @@ from glorious_hid import (
     load_mouse_state,
     save_mouse_state,
 )
+from shared_utils import atomic_write_json, find_input_events
+from via_hid import DONGLE_PRODUCT_ID as KB_DONGLE_PID
+from via_hid import PRODUCT_ID as KB_USB_PID
+from via_hid import VENDOR_ID as KB_VID
 from via_hid import KeychronRGBDevice
 
 log = logging.getLogger("keychron-auto")
@@ -28,6 +32,7 @@ BASE_DIR = os.path.dirname(os.path.abspath(__file__))
 CONFIG_PATH = os.path.join(BASE_DIR, "automation_config.json")
 PROFILES_PATH = os.path.join(BASE_DIR, "profiles.json")
 KB_STATE_PATH = os.path.join(BASE_DIR, "keyboard_state.json")
+OVERRIDE_PATH = os.path.join(BASE_DIR, "automation_override.json")
 SERVICE_NAME = "keychron-rgb-auto.service"
 
 # Coordenadas de Maia, Portugal
@@ -47,6 +52,8 @@ DEFAULT_CONFIG: dict = {
     "battery_saver_enabled": False,
     "battery_saver_threshold": 20,
     "battery_saver_brightness_pct": 15,
+    "low_battery_alert": True,
+    "low_battery_threshold": 20,
 }
 
 
@@ -107,8 +114,41 @@ def load_config() -> dict:
 
 
 def save_config(cfg: dict) -> None:
-    with open(CONFIG_PATH, "w", encoding="utf-8") as f:
-        json.dump(cfg, f, indent=2, ensure_ascii=False)
+    atomic_write_json(CONFIG_PATH, cfg, ensure_ascii=False)
+
+
+def get_current_phase(cfg: dict, now: datetime | None = None) -> str:
+    night, _ = is_night_now(cfg, now=now)
+    return "night" if night else "day"
+
+
+def set_manual_override(desired: str | None, cfg: dict | None = None) -> None:
+    """Regista ou limpa um override manual válido apenas até à próxima transição dia/noite."""
+    if desired is None:
+        try:
+            os.remove(OVERRIDE_PATH)
+        except FileNotFoundError:
+            pass
+        return
+    cfg = cfg or load_config()
+    atomic_write_json(
+        OVERRIDE_PATH,
+        {"desired": desired, "phase": get_current_phase(cfg), "ts": time.time()},
+        ensure_ascii=False,
+    )
+
+
+def load_manual_override() -> dict | None:
+    if not os.path.exists(OVERRIDE_PATH):
+        return None
+    try:
+        with open(OVERRIDE_PATH, "r", encoding="utf-8") as f:
+            data = json.load(f)
+        if isinstance(data, dict) and data.get("desired") in ("on", "off"):
+            return data
+    except (OSError, json.JSONDecodeError):
+        pass
+    return None
 
 
 def load_profile(name: str) -> dict[str, int] | None:
@@ -243,13 +283,26 @@ def _load_kb_battery_pct() -> int | None:
     return None
 
 
-def _apply_keyboard(desired: str, cfg: dict) -> bool:
-    """Aplica 'on' ou 'off' ao teclado. Devolve True apenas se comunicou com sucesso."""
+def _apply_keyboard(
+    desired: str,
+    cfg: dict,
+    persist_eeprom: bool = False,
+    force_eeprom_sync: bool = False,
+) -> tuple[bool, str]:
+    """Aplica 'on' ou 'off' ao teclado. Devolve (sucesso, connection_mode)."""
     dev = KeychronRGBDevice()
     try:
         dev.connect()
+        state = dev.get_state()
         if desired == "off":
-            dev.set_effect(0)
+            if state.effect != 0 or (persist_eeprom and force_eeprom_sync):
+                if persist_eeprom:
+                    dev.disable_and_save()
+                else:
+                    dev.set_effect(0)
+            else:
+                log.debug("Teclado: já desligado (%s)", dev.connection_mode)
+                return True, dev.connection_mode
         else:
             prof = load_profile(cfg.get("night_profile", "")) or {
                 "effect": 1,
@@ -258,22 +311,51 @@ def _apply_keyboard(desired: str, cfg: dict) -> bool:
                 "hue": 21,
                 "saturation": 255,
             }
-            bri = int(prof.get("brightness", 51))
+            eff = int(prof.get("effect", 1))
+            base_bri = int(prof.get("brightness", 51))
+            spd = int(prof.get("speed", 127))
+            hue = int(prof.get("hue", 21))
+            sat = int(prof.get("saturation", 255))
+
+            bri = base_bri
+            saver_active = False
             if cfg.get("battery_saver_enabled", False) and dev.connection_mode != "USB-C":
                 kb_pct = _load_kb_battery_pct()
                 threshold = int(cfg.get("battery_saver_threshold", 20))
                 if kb_pct is not None and kb_pct <= threshold:
                     saver_raw = round(int(cfg.get("battery_saver_brightness_pct", 15)) * 255 / 100)
-                    bri = min(bri, saver_raw)
-            dev.set_effect(int(prof.get("effect", 1)))
-            dev.set_brightness(bri)
-            dev.set_speed(int(prof.get("speed", 127)))
-            dev.set_color(int(prof.get("hue", 21)), int(prof.get("saturation", 255)))
-        log.info("Teclado: aplicado '%s' (%s)", desired, dev.connection_mode)
-        return True
+                    if saver_raw < bri:
+                        bri = saver_raw
+                        saver_active = True
+
+            needs_ram_update = (
+                state.effect != eff
+                or state.brightness != bri
+                or state.speed != spd
+                or state.hue != hue
+                or state.saturation != sat
+            )
+            if persist_eeprom and force_eeprom_sync and not saver_active:
+                dev.apply_and_save_rgb(eff, bri, spd, hue, sat)
+            elif needs_ram_update:
+                dev.set_effect(eff)
+                dev.set_brightness(bri)
+                dev.set_speed(spd)
+                dev.set_color(hue, sat)
+            else:
+                log.debug("Teclado: já no estado pretendido (%s)", dev.connection_mode)
+                return True, dev.connection_mode
+
+        log.info(
+            "Teclado: aplicado '%s'%s (%s)",
+            desired,
+            " + EEPROM" if (persist_eeprom and force_eeprom_sync) else "",
+            dev.connection_mode,
+        )
+        return True, dev.connection_mode
     except Exception as exc:
-        log.warning("Teclado: falha ao aplicar '%s' (%s)", desired, exc)
-        return False
+        log.debug("Teclado: falha ao aplicar '%s' (%s)", desired, exc)
+        return False, str(exc)
     finally:
         dev.close()
 
@@ -330,14 +412,23 @@ def _apply_mouse(desired: str, cfg: dict | None = None) -> tuple[bool, str]:
 
 
 def _apply_desired_state(
-    desired: str, cfg: dict, targets: set[str] | None = None
+    desired: str,
+    cfg: dict,
+    targets: set[str] | None = None,
+    persist_kb_eeprom: bool = False,
+    force_kb_eeprom_sync: bool = False,
 ) -> dict[str, tuple[bool, str]]:
-    """Aplica 'on' ou 'off' aos periféricos pedidos e devolve (ok, modo) por dispositivo."""
+    """Aplica 'on' ou 'off' aos periféricos pedidos e devolve (ok, info) por dispositivo."""
     wanted = targets if targets is not None else {"keyboard", "mouse"}
     results: dict[str, tuple[bool, str]] = {}
 
     if "keyboard" in wanted and cfg.get("control_keyboard", True):
-        results["keyboard"] = (_apply_keyboard(desired, cfg), "")
+        results["keyboard"] = _apply_keyboard(
+            desired,
+            cfg,
+            persist_eeprom=persist_kb_eeprom,
+            force_eeprom_sync=force_kb_eeprom_sync,
+        )
 
     if "mouse" in wanted and cfg.get("control_mouse", True):
         results["mouse"] = _apply_mouse(desired, cfg)
@@ -387,9 +478,23 @@ def run_daemon() -> int:
 
     wake_event = threading.Event()
     state_lock = threading.Lock()
-    power_state = {"off_pending": False, "force_reapply": False}
+    power_state = {"off_pending": False, "force_reapply": False, "screen_locked": is_screen_locked()}
     last_applied: dict[str, str | None] = {"keyboard": None, "mouse": None}
     mouse_activity = {"last_ts": 0.0, "pending_wake_reapply": False}
+    kb_activity = {"last_ts": 0.0}
+    warned_offline: dict[str, bool] = {"keyboard": False, "mouse": False}
+
+    def _drain_fd(fd: int) -> bool:
+        got_data = False
+        while True:
+            try:
+                chunk = os.read(fd, 4096)
+                if not chunk:
+                    raise OSError("EOF")
+                got_data = True
+            except BlockingIOError:
+                break
+        return got_data
 
     def monitor_mouse_activity() -> None:
         """Deteta movimento/clique no rato 2.4G para reaplicar iluminação ao acordar."""
@@ -405,19 +510,12 @@ def run_daemon() -> int:
                     ready, _, _ = select.select([fd], [], [], 2.0)
                     if not ready:
                         continue
-                    got_data = False
-                    while True:
-                        try:
-                            chunk = os.read(fd, 4096)
-                            if not chunk:
-                                raise OSError("EOF")
-                            got_data = True
-                        except BlockingIOError:
-                            break
-                    if not got_data:
+                    if not _drain_fd(fd):
                         continue
-                    mouse_activity["last_ts"] = time.monotonic()
-                    if mouse_activity["pending_wake_reapply"]:
+                    now_m = time.monotonic()
+                    idle = now_m - mouse_activity["last_ts"]
+                    mouse_activity["last_ts"] = now_m
+                    if mouse_activity["pending_wake_reapply"] or idle >= 180.0:
                         mouse_activity["pending_wake_reapply"] = False
                         time.sleep(0.3)
                         with state_lock:
@@ -434,30 +532,53 @@ def run_daemon() -> int:
                     except OSError:
                         pass
 
-    def monitor_screensaver() -> None:
-        try:
-            proc = subprocess.Popen(
-                [
-                    "gdbus",
-                    "monitor",
-                    "--session",
-                    "--dest",
-                    "org.gnome.ScreenSaver",
-                    "--object-path",
-                    "/org/gnome/ScreenSaver",
-                ],
-                stdout=subprocess.PIPE,
-                stderr=subprocess.DEVNULL,
-                text=True,
-            )
-            if proc.stdout:
-                for line in proc.stdout:
-                    if "ActiveChanged" in line:
+    def monitor_keyboard_activity() -> None:
+        """Deteta teclas no Keychron (2.4G ou USB-C) para aplicar imediatamente ao acordar."""
+        while True:
+            ev_paths = find_input_events(KB_VID, (KB_USB_PID, KB_DONGLE_PID))
+            if not ev_paths:
+                time.sleep(2.0)
+                continue
+            fds: list[int] = []
+            try:
+                for p in ev_paths:
+                    try:
+                        fds.append(os.open(p, os.O_RDONLY | os.O_NONBLOCK))
+                    except OSError:
+                        pass
+                if not fds:
+                    time.sleep(2.0)
+                    continue
+                while True:
+                    ready, _, _ = select.select(fds, [], [], 2.0)
+                    if not ready:
+                        continue
+                    got_data = False
+                    for rfd in ready:
+                        if _drain_fd(rfd):
+                            got_data = True
+                    if not got_data:
+                        continue
+                    now_m = time.monotonic()
+                    idle = now_m - kb_activity["last_ts"]
+                    kb_activity["last_ts"] = now_m
+                    # Se o teclado estava offline ou esteve inativo >= 10s, acorda o daemon
+                    if warned_offline["keyboard"] or idle >= 10.0 or last_applied["keyboard"] is None:
+                        time.sleep(0.15)
+                        with state_lock:
+                            if not power_state["off_pending"] and idle >= 180.0:
+                                last_applied["keyboard"] = None
                         wake_event.set()
-        except Exception:
-            pass
+            except OSError:
+                time.sleep(2.0)
+            finally:
+                for fd in fds:
+                    try:
+                        os.close(fd)
+                    except OSError:
+                        pass
 
-    def monitor_logind() -> None:
+    def monitor_dbus() -> None:
         try:
             import gi
 
@@ -467,13 +588,22 @@ def run_daemon() -> int:
             return
 
         try:
-            bus = Gio.bus_get_sync(Gio.BusType.SYSTEM, None)
+            sys_bus = Gio.bus_get_sync(Gio.BusType.SYSTEM, None)
         except Exception:
-            return
+            sys_bus = None
 
-        inhibit_fd: int | None = _acquire_logind_inhibit(bus, Gio, GLib)
+        try:
+            sess_bus = Gio.bus_get_sync(Gio.BusType.SESSION, None)
+        except Exception:
+            sess_bus = None
 
-        def on_prepare(_conn: object, _sender: str, _path: str, _iface: str, _signal: str, params: object) -> None:
+        inhibit_fd: int | None = (
+            _acquire_logind_inhibit(sys_bus, Gio, GLib) if sys_bus is not None else None
+        )
+
+        def on_prepare(
+            _conn: object, _sender: str, _path: str, _iface: str, _signal: str, params: object
+        ) -> None:
             nonlocal inhibit_fd
             going_down = bool(params.unpack()[0])
             if going_down:
@@ -482,7 +612,7 @@ def run_daemon() -> int:
                 if cfg.get("enabled", True):
                     with state_lock:
                         results = _apply_desired_state("off", cfg)
-                        for dev_name, (ok, _conn) in results.items():
+                        for dev_name, (ok, _info) in results.items():
                             if ok:
                                 last_applied[dev_name] = "off"
                 if inhibit_fd is not None:
@@ -494,50 +624,93 @@ def run_daemon() -> int:
             else:
                 power_state["off_pending"] = False
                 power_state["force_reapply"] = True
-                if inhibit_fd is None:
-                    inhibit_fd = _acquire_logind_inhibit(bus, Gio, GLib)
+                if inhibit_fd is None and sys_bus is not None:
+                    inhibit_fd = _acquire_logind_inhibit(sys_bus, Gio, GLib)
                 wake_event.set()
 
-        for sig_name in ("PrepareForShutdown", "PrepareForSleep"):
-            bus.signal_subscribe(
-                "org.freedesktop.login1",
-                "org.freedesktop.login1.Manager",
-                sig_name,
-                "/org/freedesktop/login1",
+        def on_screensaver_active(
+            _conn: object, _sender: str, _path: str, _iface: str, _signal: str, params: object
+        ) -> None:
+            power_state["screen_locked"] = bool(params.unpack()[0])
+            wake_event.set()
+
+        if sys_bus is not None:
+            for sig_name in ("PrepareForShutdown", "PrepareForSleep"):
+                sys_bus.signal_subscribe(
+                    "org.freedesktop.login1",
+                    "org.freedesktop.login1.Manager",
+                    sig_name,
+                    "/org/freedesktop/login1",
+                    None,
+                    Gio.DBusSignalFlags.NONE,
+                    on_prepare,
+                )
+
+        if sess_bus is not None:
+            sess_bus.signal_subscribe(
+                "org.gnome.ScreenSaver",
+                "org.gnome.ScreenSaver",
+                "ActiveChanged",
+                "/org/gnome/ScreenSaver",
                 None,
                 Gio.DBusSignalFlags.NONE,
-                on_prepare,
+                on_screensaver_active,
             )
 
         GLib.MainLoop().run()
 
-    threading.Thread(target=monitor_screensaver, daemon=True).start()
-    threading.Thread(target=monitor_logind, daemon=True).start()
+    threading.Thread(target=monitor_dbus, daemon=True).start()
     threading.Thread(target=monitor_mouse_activity, daemon=True).start()
+    threading.Thread(target=monitor_keyboard_activity, daemon=True).start()
 
-    last_mtime: float = 0.0
+    def _safe_mtime(path: str) -> float:
+        try:
+            return os.path.getmtime(path) if os.path.exists(path) else 0.0
+        except OSError:
+            return 0.0
+
+    last_mtimes = (0.0, 0.0, 0.0)
+    eeprom_synced_key: tuple[str, str] | None = None
+    retry_step = 0
+    backoff_schedule = (5.0, 10.0, 20.0, 30.0, 60.0)
 
     while True:
         cfg = load_config()
-        try:
-            mtime = os.path.getmtime(CONFIG_PATH) if os.path.exists(CONFIG_PATH) else 0.0
-        except OSError:
-            mtime = 0.0
-
-        config_changed = mtime != last_mtime
-        if config_changed or power_state["force_reapply"]:
-            last_mtime = mtime
+        mtimes = (
+            _safe_mtime(CONFIG_PATH),
+            _safe_mtime(PROFILES_PATH),
+            _safe_mtime(OVERRIDE_PATH),
+        )
+        files_changed = mtimes != last_mtimes
+        if files_changed or power_state["force_reapply"]:
+            last_mtimes = mtimes
             last_applied = {"keyboard": None, "mouse": None}
             mouse_activity["pending_wake_reapply"] = False
             power_state["force_reapply"] = False
+            retry_step = 0
+            if files_changed:
+                eeprom_synced_key = None
 
         still_pending = False
         if cfg.get("enabled", True) and not power_state["off_pending"]:
-            locked = cfg.get("turn_off_on_lock", True) and is_screen_locked()
-            night, _ = is_night_now(cfg)
+            locked = cfg.get("turn_off_on_lock", True) and bool(
+                power_state["screen_locked"] or is_screen_locked()
+            )
+            phase = get_current_phase(cfg)
+            night = phase == "night"
 
+            override = load_manual_override()
+            if override and override.get("phase") != phase:
+                set_manual_override(None)
+                override = None
+
+            use_override = False
             if locked:
                 desired = "off"
+                set_manual_override(None)
+            elif override is not None:
+                desired = str(override["desired"])
+                use_override = True
             elif night:
                 desired = "on"
             elif cfg.get("turn_off_during_day", True):
@@ -552,6 +725,11 @@ def run_daemon() -> int:
                         mouse_activity["pending_wake_reapply"] = False
 
             if desired is not None:
+                # Só grava na EEPROM do teclado em transições normais Dia/Noite (nunca em lock/override)
+                persist_kb_eeprom = (not locked) and (not use_override)
+                sync_key = (phase, desired)
+                force_kb_eeprom = persist_kb_eeprom and (eeprom_synced_key != sync_key)
+
                 pending = {
                     dev_name
                     for dev_name in ("keyboard", "mouse")
@@ -560,13 +738,28 @@ def run_daemon() -> int:
                 if pending:
                     with state_lock:
                         if not power_state["off_pending"]:
-                            results = _apply_desired_state(desired, cfg, targets=pending)
-                            for dev_name, (ok, conn_type) in results.items():
+                            results = _apply_desired_state(
+                                desired,
+                                cfg,
+                                targets=pending,
+                                persist_kb_eeprom=persist_kb_eeprom,
+                                force_kb_eeprom_sync=force_kb_eeprom,
+                            )
+                            for dev_name, (ok, info) in results.items():
                                 if ok:
+                                    if warned_offline[dev_name]:
+                                        log.info(
+                                            "%s: voltou a responder; estado '%s' aplicado.",
+                                            "Teclado" if dev_name == "keyboard" else "Rato",
+                                            desired,
+                                        )
+                                        warned_offline[dev_name] = False
                                     last_applied[dev_name] = desired
+                                    if dev_name == "keyboard" and persist_kb_eeprom:
+                                        eeprom_synced_key = sync_key
                                     if dev_name == "mouse":
                                         idle_sec = time.monotonic() - mouse_activity["last_ts"]
-                                        if conn_type == "receiver" and idle_sec >= 3.0:
+                                        if info == "receiver" and idle_sec >= 3.0:
                                             mouse_activity["pending_wake_reapply"] = True
                                             log.info(
                                                 "Rato: enviado via 2.4G sem atividade recente; "
@@ -574,13 +767,29 @@ def run_daemon() -> int:
                                             )
                                         else:
                                             mouse_activity["pending_wake_reapply"] = False
+                                else:
+                                    if not warned_offline[dev_name]:
+                                        log.warning(
+                                            "%s: falha ao aplicar '%s' (%s)",
+                                            "Teclado" if dev_name == "keyboard" else "Rato",
+                                            desired,
+                                            info,
+                                        )
+                                        warned_offline[dev_name] = True
 
                 still_pending = any(
                     cfg.get(f"control_{dev_name}", True) and last_applied[dev_name] != desired
                     for dev_name in ("keyboard", "mouse")
                 )
 
-        wake_event.wait(timeout=5.0 if still_pending else 30.0)
+        if still_pending:
+            wait_sec = backoff_schedule[min(retry_step, len(backoff_schedule) - 1)]
+            retry_step += 1
+        else:
+            retry_step = 0
+            wait_sec = 30.0
+
+        wake_event.wait(timeout=wait_sec)
         wake_event.clear()
 
 

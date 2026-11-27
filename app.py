@@ -8,8 +8,9 @@ import colorsys
 import json
 import os
 import sys
+import threading
 
-from PySide6.QtCore import QRect, Qt, QTimer
+from PySide6.QtCore import QRect, Qt, QTimer, Signal
 from PySide6.QtGui import QAction, QBrush, QColor, QFont, QIcon, QPainter, QPen, QPixmap
 from PySide6.QtWidgets import (
     QApplication,
@@ -40,12 +41,14 @@ from automation import (
     notify_full_battery,
     notify_low_battery,
     save_config as save_auto_config,
+    set_manual_override,
     set_service_enabled,
 )
 from battery_dialog import BatteryHistoryDialog
 from battery_log import format_battery_summary, record_battery
 from headphones_tab import HeadphonesTab
 from mouse_tab import MouseTab
+from shared_utils import atomic_write_json
 from via_hid import EFFECTS, KeychronRGBDevice
 
 PROFILES_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "profiles.json")
@@ -279,10 +282,13 @@ def qcolor_to_qmk_hs(color: QColor) -> tuple[int, int]:
 
 
 class KeychronRGBWindow(QMainWindow):
+    _kbSyncCompleted = Signal(object)
+
     def __init__(self) -> None:
         super().__init__()
         self.device = KeychronRGBDevice()
         self._syncing = False
+        self._kb_sync_busy = False
         self._last_active_effect = 1
         self._kb_battery_pct: int | None = self._load_kb_battery()
         self._kb_bat_window: deque[int] = deque(maxlen=5)
@@ -314,8 +320,10 @@ class KeychronRGBWindow(QMainWindow):
         self._color_timer.setInterval(25)
         self._color_timer.timeout.connect(self._flush_color)
 
+        self._kbSyncCompleted.connect(self._on_kb_sync_completed)
+
         self._kb_bat_timer = QTimer(self)
-        self._kb_bat_timer.setInterval(10000)
+        self._kb_bat_timer.setInterval(300000)  # 5 minutos para não impedir sleep 2.4G
         self._kb_bat_timer.timeout.connect(self._periodic_kb_check)
 
         self._build_ui()
@@ -694,11 +702,19 @@ class KeychronRGBWindow(QMainWindow):
         self.mouse_tab.batteryUpdated.connect(self._update_tray_tooltip)
         self.headphones_tab = HeadphonesTab()
         self.headphones_tab.batteryUpdated.connect(self._update_tray_tooltip)
+
+        auto_tab = QWidget()
+        auto_tab_layout = QVBoxLayout(auto_tab)
+        auto_tab_layout.setContentsMargins(0, 8, 0, 0)
+        auto_tab_layout.setSpacing(12)
+        auto_tab_layout.addWidget(self.auto_card)
+        auto_tab_layout.addStretch()
+
         self.tabs.addTab(kb_tab, "Teclado · Keychron V6 Max")
         self.tabs.addTab(self.mouse_tab, "Rato · Glorious Model I 2")
         self.tabs.addTab(self.headphones_tab, "Auscultadores · REDMI Neo")
+        self.tabs.addTab(auto_tab, "Automação")
         outer_layout.addWidget(self.tabs)
-        outer_layout.addWidget(self.auto_card)
         self._load_auto_ui()
 
     def _set_controls_enabled(self, enabled: bool) -> None:
@@ -735,18 +751,37 @@ class KeychronRGBWindow(QMainWindow):
         )
 
     def connect_and_sync(self) -> None:
+        if self._kb_sync_busy:
+            return
+        self._kb_sync_busy = True
         self.feedback_lbl.setText("")
-        try:
-            path = self.device.connect()
-            state = self.device.get_state()
-        except Exception as exc:
+        self.reconnect_btn.setEnabled(False)
+        self.refresh_btn.setEnabled(False)
+
+        def _worker() -> None:
+            try:
+                path = self.device.connect()
+                state = self.device.get_state()
+                self._kbSyncCompleted.emit({"ok": True, "path": path, "state": state})
+            except Exception as exc:
+                self._kbSyncCompleted.emit({"ok": False, "error": str(exc)})
+
+        threading.Thread(target=_worker, daemon=True).start()
+
+    def _on_kb_sync_completed(self, res: dict) -> None:
+        self._kb_sync_busy = False
+        self.reconnect_btn.setEnabled(True)
+        self.refresh_btn.setEnabled(True)
+        if not res.get("ok"):
             self._set_controls_enabled(False)
             self.status_lbl.setText(
-                f"Desligado — verifica o cabo USB-C e o interruptor em 'Cable' ({exc})"
+                f"Desligado — verifica o cabo USB-C e o interruptor em 'Cable' ({res.get('error')})"
             )
             self.status_lbl.setStyleSheet("color: #ff6b6b; font-size: 12px;")
             return
 
+        path = res["path"]
+        state = res["state"]
         self.status_lbl.setText(
             f"Ligado via {self.device.connection_mode} ({path}) · VIA v{state.protocol_version}"
         )
@@ -778,7 +813,8 @@ class KeychronRGBWindow(QMainWindow):
 
     def _periodic_kb_check(self) -> None:
         if not self.device.is_connected:
-            self.connect_and_sync()
+            if self.isVisible():
+                self.connect_and_sync()
         else:
             self._refresh_kb_battery()
 
@@ -797,8 +833,7 @@ class KeychronRGBWindow(QMainWindow):
     @staticmethod
     def _save_kb_battery(pct: int) -> None:
         try:
-            with open(KB_STATE_PATH, "w", encoding="utf-8") as f:
-                json.dump({"battery_pct": pct}, f, indent=2)
+            atomic_write_json(KB_STATE_PATH, {"battery_pct": pct})
         except OSError:
             pass
 
@@ -935,6 +970,7 @@ class KeychronRGBWindow(QMainWindow):
         self._update_effect_dependent_state(eff_id)
         try:
             self.device.set_effect(eff_id)
+            set_manual_override("on" if eff_id > 0 else "off")
             self.feedback_lbl.setText("Alterado (não guardado na memória)")
         except Exception as exc:
             self._handle_hid_error(exc)
@@ -969,6 +1005,7 @@ class KeychronRGBWindow(QMainWindow):
         self._syncing = False
         try:
             self.device.set_effect(target_effect)
+            set_manual_override("on" if checked else "off")
             self.feedback_lbl.setText("Luzes ligadas" if checked else "Luzes desligadas")
         except Exception as exc:
             self._handle_hid_error(exc)
@@ -988,8 +1025,7 @@ class KeychronRGBWindow(QMainWindow):
 
     @staticmethod
     def _save_profiles_file(profiles: dict[str, dict[str, int]]) -> None:
-        with open(PROFILES_PATH, "w", encoding="utf-8") as f:
-            json.dump(profiles, f, indent=2, ensure_ascii=False)
+        atomic_write_json(PROFILES_PATH, profiles, ensure_ascii=False)
 
     def _refresh_profile_combo(self, select_name: str | None = None) -> None:
         self.profile_combo.clear()
@@ -1062,6 +1098,7 @@ class KeychronRGBWindow(QMainWindow):
         cfg = load_auto_config()
         cfg["enabled"] = checked
         save_auto_config(cfg)
+        set_manual_override(None)
         ok, err = set_service_enabled(checked)
         if ok:
             self.feedback_lbl.setText(
@@ -1090,6 +1127,7 @@ class KeychronRGBWindow(QMainWindow):
             "battery_saver_enabled": saver_enabled,
         }
         save_auto_config(cfg)
+        set_manual_override(None)
         self._check_kb_battery_saver()
         self.mouse_tab.check_battery_saver(
             saver_enabled,
@@ -1143,6 +1181,7 @@ class KeychronRGBWindow(QMainWindow):
                 applied_parts.append("Rato")
 
         if applied_parts:
+            set_manual_override("on")
             self.feedback_lbl.setText(
                 f"Perfil '{name}' aplicado ({' + '.join(applied_parts)}) ✓"
             )
@@ -1277,16 +1316,7 @@ class KeychronRGBWindow(QMainWindow):
             self._apply_preset(h, s)
 
     def _apply_and_save_rgb(self, eff: int, bri: int, spd: int, hue: int, sat: int) -> None:
-        # O QMK via_qmk_rgb_matrix_save() usa '==' na máscara de bits, pelo que só grava
-        # se cada campo for guardado individualmente após ser alterado.
-        self.device.set_effect(eff)
-        self.device.save_eeprom()
-        self.device.set_brightness(bri)
-        self.device.save_eeprom()
-        self.device.set_speed(spd)
-        self.device.save_eeprom()
-        self.device.set_color(hue, sat)
-        self.device.save_eeprom()
+        self.device.apply_and_save_rgb(eff, bri, spd, hue, sat)
 
     def _save_eeprom(self) -> None:
         try:
@@ -1499,6 +1529,7 @@ class KeychronRGBWindow(QMainWindow):
         self.showNormal()
         self.raise_()
         self.activateWindow()
+        self.connect_and_sync()
 
     def _quit_app(self) -> None:
         self._force_quit = True
